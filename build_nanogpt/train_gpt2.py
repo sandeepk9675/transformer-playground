@@ -157,8 +157,8 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+        # if non_embedding:
+        #     n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -265,6 +265,26 @@ class GPT(nn.Module):
 
         return model
     
+    def configure_optmizers(self, weight_decay, learning_rate, device):
+        # start with all of the weights parameters (that require gradients)
+        param_dict = {pn: p for pn, p in self.named_parameters() }
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in the matmuls + embedding decay, all biases and layernorms don't.
+        decay_params = [p for pn, p in param_dict.items() if p.ndim >= 2]
+        no_decay_params = [p for pn, p in param_dict.items() if p.ndim < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_no_decay_params = sum(p.numel() for p in no_decay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(no_decay_params)}, with {num_no_decay_params:,} parameters")
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        print(f"fused AdamW available: {fused_available}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=fused_available)
+        return optimizer
 #--------------------------------------------------------------------
 import tiktoken
 
@@ -307,27 +327,69 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(1337)
 
-train_loader = DataLoaderLite(B=16, T=1024)
+total_batch_size = 524288 # 2**19, ~0.5M, in the numebr of tokens
+
+B = 16 # micro batch size
+T = 1024 # sequence length
+assert total_batch_size % (B * T) == 0, "make sure total batch size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size (in tokens): {total_batch_size}")
+print(f"grad_accum_steps: {grad_accum_steps}")
+
+
+train_loader = DataLoaderLite(B=B, T=1024)
+
+torch.set_float32_matmul_precision('high')
+
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+model = torch.compile(model)
+
+max_lr= 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(it):
+    # 1) Linear warmup for warmup_iters step
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    # 2) Cosine learning rate decay for the rest of training
+    if it > max_steps:
+        return min_lr
+    
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0.0 <= decay_ratio <= 1.0
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) #coeff starts at 1.0, ends at 0.0
+    return min_lr + coeff * (max_lr - min_lr)
 
 # ! optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = model.configure_optmizers(weight_decay=1e-1, learning_rate=max_lr, device=device)
 
-for i in range(50):
+for step in range(50):
+    loss_accum = 0.0
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x = x.to(device)
-    y = y.to(device)
-    logits, loss = model(x, y)
     optimizer.zero_grad()
-    loss.backward()
+    for micro_step in  range(grad_accum_steps):   
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
-    print(f"step {i}, loss {loss.item()} : dt {dt*1000:.2f} ms")
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / dt
+    print(f"step  {step:4d} | loss_accum: {loss_accum.item():.4f} | norm: {norm:.4e} | lr: {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 
 import sys; sys.exit(0)
